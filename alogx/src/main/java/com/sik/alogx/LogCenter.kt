@@ -8,6 +8,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
+import java.util.Calendar
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -81,8 +82,8 @@ object LogCenter {
         )
         if (!baseDir.exists()) baseDir.mkdirs()
 
-        // 第一次启动强制滚动一次，确保 writer 准备完毕
-        rolloverIfNeeded(true)
+        // 启动时只做一次“状态恢复 / 当天检测”
+        rolloverIfNeeded(false)
 
         // 开启 logcat 采集（系统 logcat → 本地 logcat.log）
         if (cfg.enableLogcat) {
@@ -104,7 +105,7 @@ object LogCenter {
      */
     @Synchronized
     fun log(level: Char, tag: String, msg: String) {
-        rolloverIfNeeded() // 检查是否需要日切
+        rolloverIfNeeded() // 检查是否需要日切/恢复 writer
         val writer = mainWriter ?: return
 
         // 统一日志格式（写文件用这条）
@@ -161,6 +162,7 @@ object LogCenter {
         val file = File(blobDir, "$hash$suffix")
 
         try {
+            // 这里按你原来的逻辑，用 bytes.toHex()，假设你自己有扩展
             file.writeText(bytes.toHex(), Charsets.UTF_8)
         } catch (e: IOException) {
             Log.e("ALogX", "saveBlob error: ${e.message}", e)
@@ -177,17 +179,6 @@ object LogCenter {
 
     /**
      * 将一段字符串作为 blob 保存到“当天目录/blobs/”下，并返回引用信息。
-     *
-     * 场景：你已经有一个很长的字符串（比如 base64 / HEX / 压缩后的 JSON 等），
-     *       不想直接打日志，只想落到文件里，然后日志里打一条引用。
-     *
-     * 目录结构示例：
-     *   /sdcard/ALogX/logs/2025-11-14/blobs/ab23cd9f.txt
-     *
-     * @param content 要保存的字符串（已经是你处理好的 blob）
-     * @param suffix  文件后缀，例如 ".txt"、".b64"、".hex"
-     *
-     * @return BlobInfo（包含相对路径、大小、hash），失败返回 null
      */
     @Synchronized
     fun saveBlobString(content: String, suffix: String = ".txt"): BlobInfo? {
@@ -231,6 +222,18 @@ object LogCenter {
         return dig.joinToString("") { "%02x".format(it) }
     }
 
+    /**
+     * 把文件的 lastModified 转成 yyyy-MM-dd，和 Utils.today() 同格式。
+     */
+    private fun dayOf(millis: Long): String {
+        val cal = Calendar.getInstance()
+        cal.timeInMillis = millis
+        val y = cal.get(Calendar.YEAR)
+        val m = cal.get(Calendar.MONTH) + 1
+        val d = cal.get(Calendar.DAY_OF_MONTH)
+        return String.format("%04d-%02d-%02d", y, m, d)
+    }
+
     // ============================================================
     // 日切逻辑（核心）
     // ============================================================
@@ -240,42 +243,69 @@ object LogCenter {
      * - main.log → yyyy-MM-dd/app.log
      * - 创建新 main.log
      * - 清理过期天数
+     *
+     * 额外行为：
+     * - 同一天内多次 init / 多次调用，只会以 append 模式接着写，不会清空 main.log/logcat.log。
      */
     @Synchronized
     private fun rolloverIfNeeded(force: Boolean = false) {
+        if (!::baseDir.isInitialized) return
 
         val today = Utils.today()
+        val mainFile = File(baseDir, "main.log")
 
-        // 不需要滚动
-        if (!force && today == currentDay) return
+        // 1. 进程重启情况下，currentDay 可能是 ""，尝试从 main.log 推断日期
+        if (currentDay.isEmpty() && mainFile.exists()) {
+            currentDay = dayOf(mainFile.lastModified())
+        }
 
-        // 关闭旧 writer
+        // 2. 如果不是强制，并且已经是今天 -> 不需要日切，只要确保 writer 打开且是 append
+        if (!force && today == currentDay) {
+            // main.log 追加模式
+            if (mainWriter == null) {
+                mainWriter = FileOutputStream(mainFile, /* append = */ true)
+                    .bufferedWriter(Charsets.UTF_8)
+            }
+
+            // logcat.log 追加模式
+            if (config.enableLogcat && logcatWriter == null) {
+                val dayDir = File(baseDir, today)
+                if (!dayDir.exists()) dayDir.mkdirs()
+                val logcatFile = File(dayDir, "logcat.log")
+                logcatWriter = FileOutputStream(logcatFile, true)
+                    .bufferedWriter(Charsets.UTF_8)
+            }
+            return
+        }
+
+        // 3. 下面是真正要“切日”的分支（force = true 或 today != currentDay）
+
+        // 先关旧 writer
         mainWriter?.close()
         mainWriter = null
         logcatWriter?.close()
         logcatWriter = null
 
-        // 如果 currentDay 不为空，表示不是第一次启动，需要把 main.log 移到当日目录
-        if (currentDay.isNotEmpty()) {
-            val oldMain = File(baseDir, "main.log")
-            if (oldMain.exists()) {
-                val dayDir = File(baseDir, currentDay)
-                if (!dayDir.exists()) dayDir.mkdirs()
-                oldMain.renameTo(File(dayDir, "app.log"))
-            }
+        // 有已知的 currentDay，且 main.log 存在 -> 归档成那一天的 app.log
+        if (currentDay.isNotEmpty() && mainFile.exists()) {
+            val dayDir = File(baseDir, currentDay)
+            if (!dayDir.exists()) dayDir.mkdirs()
+            mainFile.renameTo(File(dayDir, "app.log"))
         }
 
-        // 更新到新的一天
+        // 切换到今天
         currentDay = today
 
-        // 创建新的 main.log writer（写“今日主日志”）
-        mainWriter = File(baseDir, "main.log").bufferedWriter(Charsets.UTF_8, 8192)
+        // 新的一天：main.log 从空文件开始写（覆盖模式）
+        mainWriter = FileOutputStream(mainFile, /* append = */ false)
+            .bufferedWriter(Charsets.UTF_8)
 
-        // 同步创建 logcat 当天文件（如果启用）
         if (config.enableLogcat) {
             val dayDir = File(baseDir, currentDay)
             if (!dayDir.exists()) dayDir.mkdirs()
-            logcatWriter = File(dayDir, "logcat.log").bufferedWriter(Charsets.UTF_8, 8192)
+            val logcatFile = File(dayDir, "logcat.log")
+            logcatWriter = FileOutputStream(logcatFile, false)
+                .bufferedWriter(Charsets.UTF_8)
         }
 
         // 清理历史日志
@@ -316,7 +346,7 @@ object LogCenter {
 
         logcatThread = Thread({
             try {
-                // 清空旧 logcat 缓存
+                // 清空旧 logcat 缓存（如果你想保留系统之前的 log，可以把这行删掉）
                 Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
 
                 // 启动 logcat 流
