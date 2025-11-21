@@ -12,7 +12,6 @@ import java.util.Calendar
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-
 /**
  * ALogX 核心类。
  *
@@ -37,7 +36,7 @@ object LogCenter {
     @Volatile
     private var currentDay = ""
 
-    /** 主日志 writer（用于写 main.log 或当天 app.log） */
+    /** 主日志 writer（用于写 main.log） */
     @Volatile
     private var mainWriter: BufferedWriter? = null
 
@@ -80,10 +79,17 @@ object LogCenter {
             Environment.getExternalStorageDirectory(),
             "${cfg.appName}/logs"
         )
-        if (!baseDir.exists()) baseDir.mkdirs()
+
+        if (!baseDir.exists()) {
+            if (!baseDir.mkdirs()) {
+                Log.e("ALogX", "init: mkdirs baseDir failed: ${baseDir.absolutePath}")
+                // 目录都建不出来，后续直接 return，避免一堆 FileNotFound 崩溃
+                return
+            }
+        }
 
         // 启动时只做一次“状态恢复 / 当天检测”
-        rolloverIfNeeded(false)
+        rolloverIfNeeded(force = false)
 
         // 开启 logcat 采集（系统 logcat → 本地 logcat.log）
         if (cfg.enableLogcat) {
@@ -108,7 +114,6 @@ object LogCenter {
         rolloverIfNeeded() // 检查是否需要日切/恢复 writer
         val writer = mainWriter ?: return
 
-        // 统一日志格式（写文件用这条）
         val line = "${Utils.now()} | $level/$tag | ${Thread.currentThread().name} | $msg"
 
         // 1. 写文件
@@ -116,7 +121,7 @@ object LogCenter {
         writer.newLine()
         writer.flush()
 
-        // 2. 顺便打到 Android logcat（调试方便）
+        // 2. 顺便打到 Android logcat
         when (level) {
             'V' -> Log.v(tag, line)
             'D' -> Log.d(tag, line)
@@ -128,32 +133,39 @@ object LogCenter {
         }
     }
 
+    // ============================================================
+    // Blob 落盘
+    // ============================================================
+
     /**
      * 将一段二进制数据保存到“当天目录/blobs/”下，并返回引用信息。
      *
      * 目录结构示例：
      *   /sdcard/ALogX/logs/2025-11-14/blobs/ab23cd9f.png
-     *
-     * @param bytes  要保存的二进制数据（已经是解码后的）
-     * @param suffix 文件后缀，例如 ".png"、".jpg"、".bin"
-     *
-     * @return BlobInfo（包含相对路径、大小、hash）
      */
     @Synchronized
     fun saveBlob(bytes: ByteArray, suffix: String = ".bin"): BlobInfo? {
-        // 确保当前 day 状态正确
+        // 确保当前 day 状态正确（里面会确保 baseDir 有）
         rolloverIfNeeded()
 
-        // 如果还没初始化 baseDir，直接放弃
         if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
+
+        if (!baseDir.exists() && !baseDir.mkdirs()) {
+            Log.e("ALogX", "saveBlob: mkdirs baseDir failed: ${baseDir.absolutePath}")
+            return null
+        }
 
         // 当天目录：/logs/yyyy-MM-dd
         val dayDir = File(baseDir, currentDay)
-        if (!dayDir.exists()) dayDir.mkdirs()
+        if (!dayDir.exists() && !dayDir.mkdirs()) {
+            Log.e("ALogX", "saveBlob: mkdirs dayDir failed: ${dayDir.absolutePath}")
+            return null
+        }
 
         // blobs 子目录：/logs/yyyy-MM-dd/blobs
         val blobDir = File(dayDir, "blobs")
         if (!blobDir.exists() && !blobDir.mkdirs()) {
+            Log.e("ALogX", "saveBlob: mkdirs blobDir failed: ${blobDir.absolutePath}")
             return null
         }
 
@@ -161,20 +173,26 @@ object LogCenter {
         val hash = md5(bytes)
         val file = File(blobDir, "$hash$suffix")
 
-        try {
-            // 这里按你原来的逻辑，用 bytes.toHex()，假设你自己有扩展
-            file.writeText(bytes.toHex(), Charsets.UTF_8)
-        } catch (e: IOException) {
-            Log.e("ALogX", "saveBlob error: ${e.message}", e)
-            return null
+        file.parentFile?.let { parent ->
+            if (!parent.exists() && !parent.mkdirs()) {
+                Log.e("ALogX", "saveBlob: mkdirs parent failed: ${parent.absolutePath}")
+                return null
+            }
         }
 
-        val relPath = file.relativeTo(baseDir).invariantSeparatorsPath
-        return BlobInfo(
-            relativePath = relPath,
-            size = bytes.size,
-            hash = hash
-        )
+        return try {
+            // 这里按你原来的逻辑，用 bytes.toHex()（假设你自己扩展了）
+            file.writeText(bytes.toHex(), Charsets.UTF_8)
+            val relPath = file.relativeTo(baseDir).invariantSeparatorsPath
+            BlobInfo(
+                relativePath = relPath,
+                size = bytes.size,
+                hash = hash
+            )
+        } catch (e: IOException) {
+            Log.e("ALogX", "saveBlob error: ${e.message}", e)
+            null
+        }
     }
 
     /**
@@ -186,18 +204,33 @@ object LogCenter {
 
         if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
 
-        val dayDir = File(baseDir, currentDay)
-        if (!dayDir.exists()) dayDir.mkdirs()
-
-        val blobDir = File(dayDir, "blobs")
-        if (!blobDir.exists() && !blobDir.mkdirs()) {
+        if (!baseDir.exists() && !baseDir.mkdirs()) {
+            Log.e("ALogX", "saveBlobString: mkdirs baseDir failed: ${baseDir.absolutePath}")
             return null
         }
 
-        // 用内容算 md5，当成文件名，方便去重和排查
+        val dayDir = File(baseDir, currentDay)
+        if (!dayDir.exists() && !dayDir.mkdirs()) {
+            Log.e("ALogX", "saveBlobString: mkdirs dayDir failed: ${dayDir.absolutePath}")
+            return null
+        }
+
+        val blobDir = File(dayDir, "blobs")
+        if (!blobDir.exists() && !blobDir.mkdirs()) {
+            Log.e("ALogX", "saveBlobString: mkdirs blobDir failed: ${blobDir.absolutePath}")
+            return null
+        }
+
         val bytes = content.toByteArray(Charsets.UTF_8)
         val hash = md5(bytes)
         val file = File(blobDir, "$hash$suffix")
+
+        file.parentFile?.let { parent ->
+            if (!parent.exists() && !parent.mkdirs()) {
+                Log.e("ALogX", "saveBlobString: mkdirs parent failed: ${parent.absolutePath}")
+                return null
+            }
+        }
 
         return try {
             file.writeText(content, Charsets.UTF_8)
@@ -261,8 +294,15 @@ object LogCenter {
 
         // 2. 如果不是强制，并且已经是今天 -> 不需要日切，只要确保 writer 打开且是 append
         if (!force && today == currentDay) {
+            if (!baseDir.exists()) {
+                baseDir.mkdirs()
+            }
+
             // main.log 追加模式
             if (mainWriter == null) {
+                mainFile.parentFile?.let { parent ->
+                    if (!parent.exists()) parent.mkdirs()
+                }
                 mainWriter = FileOutputStream(mainFile, /* append = */ true)
                     .bufferedWriter(Charsets.UTF_8)
             }
@@ -272,6 +312,10 @@ object LogCenter {
                 val dayDir = File(baseDir, today)
                 if (!dayDir.exists()) dayDir.mkdirs()
                 val logcatFile = File(dayDir, "logcat.log")
+
+                logcatFile.parentFile?.let { parent ->
+                    if (!parent.exists()) parent.mkdirs()
+                }
                 logcatWriter = FileOutputStream(logcatFile, true)
                     .bufferedWriter(Charsets.UTF_8)
             }
@@ -286,17 +330,29 @@ object LogCenter {
         logcatWriter?.close()
         logcatWriter = null
 
+        if (!baseDir.exists()) {
+            baseDir.mkdirs()
+        }
+
         // 有已知的 currentDay，且 main.log 存在 -> 归档成那一天的 app.log
         if (currentDay.isNotEmpty() && mainFile.exists()) {
             val dayDir = File(baseDir, currentDay)
             if (!dayDir.exists()) dayDir.mkdirs()
-            mainFile.renameTo(File(dayDir, "app.log"))
+            val appLogFile = File(dayDir, "app.log")
+
+            appLogFile.parentFile?.let { parent ->
+                if (!parent.exists()) parent.mkdirs()
+            }
+            mainFile.renameTo(appLogFile)
         }
 
         // 切换到今天
         currentDay = today
 
         // 新的一天：main.log 从空文件开始写（覆盖模式）
+        mainFile.parentFile?.let { parent ->
+            if (!parent.exists()) parent.mkdirs()
+        }
         mainWriter = FileOutputStream(mainFile, /* append = */ false)
             .bufferedWriter(Charsets.UTF_8)
 
@@ -304,6 +360,10 @@ object LogCenter {
             val dayDir = File(baseDir, currentDay)
             if (!dayDir.exists()) dayDir.mkdirs()
             val logcatFile = File(dayDir, "logcat.log")
+
+            logcatFile.parentFile?.let { parent ->
+                if (!parent.exists()) parent.mkdirs()
+            }
             logcatWriter = FileOutputStream(logcatFile, false)
                 .bufferedWriter(Charsets.UTF_8)
         }
@@ -322,6 +382,8 @@ object LogCenter {
      * 目录名格式必须是 yyyy-MM-dd 才会被识别。
      */
     private fun cleanupOldDays() {
+        if (!::baseDir.isInitialized || !baseDir.exists()) return
+
         val dirs = baseDir.listFiles { f ->
             f.isDirectory && f.name.matches(Regex("\\d{4}-\\d{2}-\\d{2}"))
         }?.sortedBy { it.name } ?: return
@@ -399,24 +461,22 @@ object LogCenter {
      * 则在 zip 里生成一个“合并版”的 app.log：
      *   [ dayDir/app.log(如果存在) ] + [ 当前 main.log ]
      * 不会修改磁盘上的任何日志文件，避免多次 zipDay 造成重复追加。
-     *
-     * @param day 格式 "yyyy-MM-dd"
-     * @return 生成的 zip 文件，若当天不存在返回 null
      */
     @Synchronized
     fun zipDay(day: String): File? {
-        // 确保初始化过
         if (!::baseDir.isInitialized) return null
 
         val dayDir = File(baseDir, day)
         if (!dayDir.exists()) return null
 
         val out = File(baseDir, "logs_$day.zip")
+        out.parentFile?.let { parent ->
+            if (!parent.exists()) parent.mkdirs()
+        }
         if (out.exists()) out.delete()
 
         // 如果 zip 的就是当前这一天，先 flush 一下 mainWriter，拿一个快照文件引用
         val mainLogForDay: File? = if (day == currentDay) {
-            // 保证缓冲区刷到文件
             mainWriter?.flush()
             val mainFile = File(baseDir, "main.log")
             if (mainFile.exists()) mainFile else null
@@ -430,7 +490,6 @@ object LogCenter {
             dayDir.walkTopDown()
                 .filter { it.isFile }
                 .forEach { file ->
-                    // 如果是当前天，并且是 app.log，就先跳过，后面单独写合并内容
                     if (day == currentDay && file.name == "app.log") {
                         return@forEach
                     }
@@ -451,12 +510,10 @@ object LogCenter {
 
                 zip.putNextEntry(ZipEntry(zipEntryPath))
 
-                // 1. 先写老的 app.log（如果存在）
                 if (appLogFile.exists()) {
                     appLogFile.inputStream().use { it.copyTo(zip) }
                 }
 
-                // 2. 再写当前 main.log 的内容（最新完整快照）
                 mainLogForDay?.inputStream()?.use { it.copyTo(zip) }
 
                 zip.closeEntry()
