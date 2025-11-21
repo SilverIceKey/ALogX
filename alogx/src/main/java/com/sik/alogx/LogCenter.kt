@@ -364,10 +364,19 @@ object LogCenter {
      * 压缩某一天的日志文件目录为 zip。
      * 目录结构不改变。
      *
+     * 额外逻辑：
+     * 如果 day == currentDay，且 main.log 还在写这一天的日志，
+     * 则在 zip 里生成一个“合并版”的 app.log：
+     *   [ dayDir/app.log(如果存在) ] + [ 当前 main.log ]
+     * 不会修改磁盘上的任何日志文件，避免多次 zipDay 造成重复追加。
+     *
      * @param day 格式 "yyyy-MM-dd"
      * @return 生成的 zip 文件，若当天不存在返回 null
      */
+    @Synchronized
     fun zipDay(day: String): File? {
+        // 确保初始化过
+        if (!::baseDir.isInitialized) return null
 
         val dayDir = File(baseDir, day)
         if (!dayDir.exists()) return null
@@ -375,15 +384,53 @@ object LogCenter {
         val out = File(baseDir, "logs_$day.zip")
         if (out.exists()) out.delete()
 
+        // 如果 zip 的就是当前这一天，先 flush 一下 mainWriter，拿一个快照文件引用
+        val mainLogForDay: File? = if (day == currentDay) {
+            // 保证缓冲区刷到文件
+            mainWriter?.flush()
+            val mainFile = File(baseDir, "main.log")
+            if (mainFile.exists()) mainFile else null
+        } else {
+            null
+        }
+
         ZipOutputStream(FileOutputStream(out)).use { zip ->
+
+            // 先把 dayDir 下所有文件打进去（但如果是当前天，先跳过已有的 app.log，后面用“合并版”替换）
             dayDir.walkTopDown()
                 .filter { it.isFile }
                 .forEach { file ->
+                    // 如果是当前天，并且是 app.log，就先跳过，后面单独写合并内容
+                    if (day == currentDay && file.name == "app.log") {
+                        return@forEach
+                    }
+
                     val rel = file.relativeTo(baseDir).invariantSeparatorsPath
                     zip.putNextEntry(ZipEntry(rel))
                     file.inputStream().use { it.copyTo(zip) }
                     zip.closeEntry()
                 }
+
+            // 如果是当前天，需要在 zip 里生成一个合并版 app.log：
+            // [ dayDir/app.log(如果有) ] + [ main.log ]
+            if (day == currentDay) {
+                val appLogFile = File(dayDir, "app.log")
+                val zipEntryPath = appLogFile
+                    .relativeTo(baseDir)
+                    .invariantSeparatorsPath
+
+                zip.putNextEntry(ZipEntry(zipEntryPath))
+
+                // 1. 先写老的 app.log（如果存在）
+                if (appLogFile.exists()) {
+                    appLogFile.inputStream().use { it.copyTo(zip) }
+                }
+
+                // 2. 再写当前 main.log 的内容（最新完整快照）
+                mainLogForDay?.inputStream()?.use { it.copyTo(zip) }
+
+                zip.closeEntry()
+            }
         }
 
         return out
