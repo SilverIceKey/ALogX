@@ -138,8 +138,9 @@ object ALog {
      * @param label  这块数据的用途说明（例如 "upload_image"）
      * @param bytes  二进制数据（例如图片/压缩包等）
      * @param suffix 文件后缀，例如 ".png" ".jpg" ".bin"
+     * @return BlobInfo 文件相对路径
      */
-    fun blob(tag: String, label: String, bytes: ByteArray, suffix: String = ".bin") {
+    fun blob(tag: String, label: String, bytes: ByteArray, suffix: String = ".bin"): String {
         val info = LogCenter.saveBlob(bytes, suffix)
         if (info == null) {
             e(tag, "blob save failed | label=$label | size=${bytes.size}")
@@ -149,13 +150,14 @@ object ALog {
                 "blob saved | label=$label | size=${info.size} | hash=${info.hash} | blobPath=${info.relativePath}"
             )
         }
+        return info?.relativePath.orEmpty()
     }
 
     /**
      * 自动 TAG 版本：直接传 label + bytes数组。
      */
-    fun blob(label: String, bytes: ByteArray, suffix: String = ".bin") {
-        blob(autoTag(), label, bytes, suffix)
+    fun blob(label: String, bytes: ByteArray, suffix: String = ".bin"): String {
+        return blob(autoTag(), label, bytes, suffix)
     }
 
     // ─────────────────── BLOB 字符串输出（大块 String 单独存文件）──────────────────
