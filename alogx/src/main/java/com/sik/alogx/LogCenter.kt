@@ -3,12 +3,20 @@ package com.sik.alogx
 import android.content.Context
 import android.os.Environment
 import android.util.Log
-import java.io.BufferedWriter
+import okio.BufferedSink
+import okio.HashingSink
+import okio.Sink
+import okio.blackholeSink
+import okio.buffer
+import okio.sink
+import okio.source
+import okio.use
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.Calendar
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -36,13 +44,18 @@ object LogCenter {
     @Volatile
     private var currentDay = ""
 
-    /** 主日志 writer（用于写 main.log） */
+    /**
+     * 主日志 sink（写 main.log）
+     * 用 Okio BufferedSink 替代 BufferedWriter，减少 String 拼接与中间拷贝
+     */
     @Volatile
-    private var mainWriter: BufferedWriter? = null
+    private var mainSink: BufferedSink? = null
 
-    /** logcat 捕获 writer（写 yyyy-MM-dd/logcat.log） */
+    /**
+     * logcat 捕获 sink（写 yyyy-MM-dd/logcat.log）
+     */
     @Volatile
-    private var logcatWriter: BufferedWriter? = null
+    private var logcatSink: BufferedSink? = null
 
     /** logcat 捕获后台线程 */
     @Volatile
@@ -97,7 +110,6 @@ object LogCenter {
         }
     }
 
-
     // ============================================================
     // 日志写入（文件 + logcat）
     // ============================================================
@@ -111,25 +123,42 @@ object LogCenter {
      */
     @Synchronized
     fun log(level: Char, tag: String, msg: String) {
-        rolloverIfNeeded() // 检查是否需要日切/恢复 writer
-        val writer = mainWriter ?: return
+        rolloverIfNeeded() // 检查是否需要日切/恢复 sink
+        val sink = mainSink ?: return
 
-        val line = "${Utils.now()} | $level/$tag | ${Thread.currentThread().name} | $msg"
+        // 注意：这里不拼接一个巨大的 line 字符串，改为分段写入，减少临时对象/拷贝
+        // 但 logcat 输出仍然使用最终 line（Android Log API 只能收 String）
+        val ts = Utils.now()
+        val threadName = Thread.currentThread().name
 
-        // 1. 写文件
-        writer.write(line)
-        writer.newLine()
-        writer.flush()
+        // 1) 写文件（逻辑不变：每条一行，写完 flush 保证稳定落盘）
+        try {
+            sink.writeUtf8(ts)
+            sink.writeUtf8(" | ")
+            sink.writeUtf8(level.toString())
+            sink.writeUtf8("/")
+            sink.writeUtf8(tag)
+            sink.writeUtf8(" | ")
+            sink.writeUtf8(threadName)
+            sink.writeUtf8(" | ")
+            sink.writeUtf8(msg)
+            sink.writeByte('\n'.code)
+            sink.flush()
+        } catch (e: IOException) {
+            // 写盘失败别递归打 ALog
+            Log.e("ALogX", "log write error: ${e.message}", e)
+        }
 
-        // 2. 顺便打到 Android logcat
+        // 2) 顺便打到 Android logcat（保持你原来的格式）
+        val lineForLogcat = "$ts | $level/$tag | $threadName | $msg"
         when (level) {
-            'V' -> Log.v(tag, line)
-            'D' -> Log.d(tag, line)
-            'I' -> Log.i(tag, line)
-            'W' -> Log.w(tag, line)
-            'E' -> Log.e(tag, line)
-            'F' -> Log.wtf(tag, line)
-            else -> Log.d(tag, line)
+            'V' -> Log.v(tag, lineForLogcat)
+            'D' -> Log.d(tag, lineForLogcat)
+            'I' -> Log.i(tag, lineForLogcat)
+            'W' -> Log.w(tag, lineForLogcat)
+            'E' -> Log.e(tag, lineForLogcat)
+            'F' -> Log.wtf(tag, lineForLogcat)
+            else -> Log.d(tag, lineForLogcat)
         }
     }
 
@@ -145,7 +174,6 @@ object LogCenter {
      */
     @Synchronized
     fun saveBlob(bytes: ByteArray, suffix: String = ".bin"): BlobInfo? {
-        // 确保当前 day 状态正确（里面会确保 baseDir 有）
         rolloverIfNeeded()
 
         if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
@@ -181,8 +209,11 @@ object LogCenter {
         }
 
         return try {
-            // 这里按你原来的逻辑，用 bytes.toHex()（假设你自己扩展了）
-            file.writeText(bytes.toHex(), Charsets.UTF_8)
+            // okio 写入，避免额外缓冲层对象
+            file.sink(append = false).buffer().use { sink ->
+                sink.write(bytes)
+                sink.flush()
+            }
             val relPath = file.relativeTo(baseDir).invariantSeparatorsPath
             BlobInfo(
                 relativePath = relPath,
@@ -197,6 +228,9 @@ object LogCenter {
 
     /**
      * 将一段字符串作为 blob 保存到“当天目录/blobs/”下，并返回引用信息。
+     *
+     * 关键点：不再 content.toByteArray() 先整块转 bytes（那一下很吃内存）
+     * 改为：边写 UTF-8 边做 MD5，写完后按 hash 重命名。
      */
     @Synchronized
     fun saveBlobString(content: String, suffix: String = ".txt"): BlobInfo? {
@@ -221,29 +255,106 @@ object LogCenter {
             return null
         }
 
-        val bytes = content.toByteArray(Charsets.UTF_8)
-        val hash = md5(bytes)
-        val file = File(blobDir, "$hash$suffix")
-
-        file.parentFile?.let { parent ->
-            if (!parent.exists() && !parent.mkdirs()) {
-                Log.e("ALogX", "saveBlobString: mkdirs parent failed: ${parent.absolutePath}")
-                return null
-            }
-        }
+        // 先写到 tmp，再按 md5 改名（和 openTextBlobStream 的逻辑一致）
+        val tmp = File(blobDir, "tmp_${System.currentTimeMillis()}$suffix")
+        val raw: Sink = tmp.sink(append = false)
+        val hashing = HashingSink.md5(raw)
+        val buffered = hashing.buffer()
 
         return try {
-            file.writeText(content, Charsets.UTF_8)
-            val relPath = file.relativeTo(baseDir).invariantSeparatorsPath
+            buffered.writeUtf8(content)
+            buffered.flush()
+            buffered.close() // 这里会同时 close hashing + raw
+
+            val hash = hashing.hash.hex()
+            val dst = File(blobDir, "$hash$suffix")
+            if (dst.exists()) {
+                // 已存在则删 tmp（去重）
+                tmp.delete()
+            } else {
+                tmp.renameTo(dst)
+            }
+
+            val relPath = dst.relativeTo(baseDir).invariantSeparatorsPath
+
+            // 精确 size：直接拿最终文件长度，避免估算 UTF-8 byte 数导致偏差
             BlobInfo(
                 relativePath = relPath,
-                size = bytes.size,
+                size = dst.length().toInt(),
                 hash = hash
             )
         } catch (e: IOException) {
+            try {
+                buffered.close()
+            } catch (_: Throwable) {
+            }
+            tmp.delete()
             Log.e("ALogX", "saveBlobString error: ${e.message}", e)
             null
         }
+    }
+
+    /**
+     * 打开一个“文本 blob 输出流”（UTF-8 bytes），调用者边写边落盘。
+     * 写完必须调用 commit(writtenBytes) 来按 md5 重命名并返回 BlobInfo。
+     *
+     * 注意：这里不做任何编码转换，调用者写什么 bytes 就保存什么 bytes。
+     *
+     * 实现改为 Okio HashingSink：边写边算 md5，无需把内容读回内存。
+     */
+    @Synchronized
+    fun openTextBlobStream(suffix: String = ".txt"): OpenBlobResult? {
+        rolloverIfNeeded()
+        if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
+
+        val dayDir = File(baseDir, currentDay).apply { if (!exists()) mkdirs() }
+        val blobDir = File(dayDir, "blobs").apply { if (!exists()) mkdirs() }
+
+        val tmp = File(blobDir, "tmp_${System.currentTimeMillis()}$suffix")
+
+        val rawSink = tmp.sink(append = false)
+        val hashingSink = HashingSink.md5(rawSink)
+        val buffered = hashingSink.buffer()
+
+        // 提供 OutputStream 给外部写（保持你原有的对外类型不变）
+        val os: OutputStream = buffered.outputStream()
+
+        val committed = AtomicBoolean(false)
+
+        val commit = { writtenBytes: Long ->
+            if (committed.compareAndSet(false, true)) {
+                try {
+                    // 关闭输出（会 flush 并关闭底层 sink）
+                    try {
+                        os.flush()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        os.close()
+                    } catch (_: Throwable) {
+                    }
+
+                    val hash = hashingSink.hash.hex()
+                    val dst = File(blobDir, "$hash$suffix")
+                    if (dst.exists()) {
+                        tmp.delete()
+                    } else {
+                        tmp.renameTo(dst)
+                    }
+                    val rel = dst.relativeTo(baseDir).invariantSeparatorsPath
+                    BlobInfo(relativePath = rel, size = writtenBytes.toInt(), hash = hash)
+                } catch (e: Throwable) {
+                    tmp.delete()
+                    Log.e("ALogX", "openTextBlobStream commit error: ${e.message}", e)
+                    null
+                }
+            } else {
+                // 重复 commit 就返回 null（避免多次 rename/close 出幺蛾子）
+                null
+            }
+        }
+
+        return OpenBlobResult(output = os, commit = commit)
     }
 
     /**
@@ -278,7 +389,7 @@ object LogCenter {
      * - 清理过期天数
      *
      * 额外行为：
-     * - 同一天内多次 init / 多次调用，只会以 append 模式接着写，不会清空 main.log/logcat.log。
+     * - 同一天内多次 init / 多次调用，只会以 append 模式接着写，不会otni清空 main.log/logcat.log。
      */
     @Synchronized
     private fun rolloverIfNeeded(force: Boolean = false) {
@@ -292,23 +403,22 @@ object LogCenter {
             currentDay = dayOf(mainFile.lastModified())
         }
 
-        // 2. 如果不是强制，并且已经是今天 -> 不需要日切，只要确保 writer 打开且是 append
+        // 2. 如果不是强制，并且已经是今天 -> 不需要日切，只要确保 sink 打开且是 append
         if (!force && today == currentDay) {
             if (!baseDir.exists()) {
                 baseDir.mkdirs()
             }
 
             // main.log 追加模式
-            if (mainWriter == null) {
+            if (mainSink == null) {
                 mainFile.parentFile?.let { parent ->
                     if (!parent.exists()) parent.mkdirs()
                 }
-                mainWriter = FileOutputStream(mainFile, /* append = */ true)
-                    .bufferedWriter(Charsets.UTF_8)
+                mainSink = mainFile.sink(append = true).buffer()
             }
 
             // logcat.log 追加模式
-            if (config.enableLogcat && logcatWriter == null) {
+            if (config.enableLogcat && logcatSink == null) {
                 val dayDir = File(baseDir, today)
                 if (!dayDir.exists()) dayDir.mkdirs()
                 val logcatFile = File(dayDir, "logcat.log")
@@ -316,19 +426,27 @@ object LogCenter {
                 logcatFile.parentFile?.let { parent ->
                     if (!parent.exists()) parent.mkdirs()
                 }
-                logcatWriter = FileOutputStream(logcatFile, true)
-                    .bufferedWriter(Charsets.UTF_8)
+                logcatSink = logcatFile.sink(append = true).buffer()
             }
             return
         }
 
         // 3. 下面是真正要“切日”的分支（force = true 或 today != currentDay）
 
-        // 先关旧 writer
-        mainWriter?.close()
-        mainWriter = null
-        logcatWriter?.close()
-        logcatWriter = null
+        // 先关旧 sink
+        try {
+            mainSink?.flush()
+            mainSink?.close()
+        } catch (_: Throwable) {
+        }
+        mainSink = null
+
+        try {
+            logcatSink?.flush()
+            logcatSink?.close()
+        } catch (_: Throwable) {
+        }
+        logcatSink = null
 
         if (!baseDir.exists()) {
             baseDir.mkdirs()
@@ -353,8 +471,7 @@ object LogCenter {
         mainFile.parentFile?.let { parent ->
             if (!parent.exists()) parent.mkdirs()
         }
-        mainWriter = FileOutputStream(mainFile, /* append = */ false)
-            .bufferedWriter(Charsets.UTF_8)
+        mainSink = mainFile.sink(append = false).buffer()
 
         if (config.enableLogcat) {
             val dayDir = File(baseDir, currentDay)
@@ -364,14 +481,12 @@ object LogCenter {
             logcatFile.parentFile?.let { parent ->
                 if (!parent.exists()) parent.mkdirs()
             }
-            logcatWriter = FileOutputStream(logcatFile, false)
-                .bufferedWriter(Charsets.UTF_8)
+            logcatSink = logcatFile.sink(append = false).buffer()
         }
 
         // 清理历史日志
         cleanupOldDays()
     }
-
 
     // ============================================================
     // 清理超期天数
@@ -393,7 +508,6 @@ object LogCenter {
             dirs.take(overflow).forEach { it.deleteRecursively() }
         }
     }
-
 
     // ============================================================
     // logcat 捕获
@@ -420,7 +534,6 @@ object LogCenter {
                 while (!Thread.currentThread().isInterrupted &&
                     reader.readLine().also { line = it } != null
                 ) {
-
                     val t = line ?: break
 
                     // 是否只记录与本包相关的 logcat 行
@@ -428,10 +541,15 @@ object LogCenter {
 
                     synchronized(this) {
                         rolloverIfNeeded()
-                        logcatWriter?.apply {
-                            write(t)
-                            newLine()
-                            flush()
+                        try {
+                            logcatSink?.apply {
+                                writeUtf8(t)
+                                writeByte('\n'.code)
+                                flush()
+                            }
+                        } catch (e: IOException) {
+                            // 注意：这里不能再调 ALog / LogCenter.log，不然递归玩死你
+                            Log.e("ALogX", "Logcat sink write error: ${e.message}", e)
                         }
                     }
                 }
@@ -446,7 +564,6 @@ object LogCenter {
             start()
         }
     }
-
 
     // ============================================================
     // 打包某一日的日志
@@ -475,16 +592,19 @@ object LogCenter {
         }
         if (out.exists()) out.delete()
 
-        // 如果 zip 的就是当前这一天，先 flush 一下 mainWriter，拿一个快照文件引用
+        // 如果 zip 的就是当前这一天，先 flush 一下 mainSink，拿一个快照文件引用
         val mainLogForDay: File? = if (day == currentDay) {
-            mainWriter?.flush()
+            try {
+                mainSink?.flush()
+            } catch (_: Throwable) {
+            }
             val mainFile = File(baseDir, "main.log")
             if (mainFile.exists()) mainFile else null
         } else {
             null
         }
 
-        ZipOutputStream(FileOutputStream(out)).use { zip ->
+        ZipOutputStream(out.outputStream()).use { zip ->
 
             // 先把 dayDir 下所有文件打进去（但如果是当前天，先跳过已有的 app.log，后面用“合并版”替换）
             dayDir.walkTopDown()
@@ -496,7 +616,11 @@ object LogCenter {
 
                     val rel = file.relativeTo(baseDir).invariantSeparatorsPath
                     zip.putNextEntry(ZipEntry(rel))
-                    file.inputStream().use { it.copyTo(zip) }
+                    file.source().use { src ->
+                        src.buffer().readAll(zip.sink().buffer()).also {
+                            // 注意：这里不能用同一个 sink 复用，ZipOutputStream 直接写即可
+                        }
+                    }
                     zip.closeEntry()
                 }
 
@@ -513,7 +637,6 @@ object LogCenter {
                 if (appLogFile.exists()) {
                     appLogFile.inputStream().use { it.copyTo(zip) }
                 }
-
                 mainLogForDay?.inputStream()?.use { it.copyTo(zip) }
 
                 zip.closeEntry()
@@ -523,7 +646,6 @@ object LogCenter {
         return out
     }
 
-
     // ============================================================
     // 停止服务（可选）
     // ============================================================
@@ -532,8 +654,28 @@ object LogCenter {
      * 强行关闭日志系统（一般不用）
      */
     fun shutdown() {
-        mainWriter?.close()
-        logcatWriter?.close()
+        try {
+            mainSink?.flush()
+            mainSink?.close()
+        } catch (_: Throwable) {
+        } finally {
+            mainSink = null
+        }
+
+        try {
+            logcatSink?.flush()
+            logcatSink?.close()
+        } catch (_: Throwable) {
+        } finally {
+            logcatSink = null
+        }
+
         logcatThread?.interrupt()
+        logcatThread = null
     }
+
+    data class OpenBlobResult(
+        val output: OutputStream,
+        val commit: (writtenBytes: Long) -> BlobInfo?
+    )
 }
