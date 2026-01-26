@@ -587,60 +587,63 @@ object LogCenter {
         if (!dayDir.exists()) return null
 
         val out = File(baseDir, "logs_$day.zip")
-        out.parentFile?.let { parent ->
-            if (!parent.exists()) parent.mkdirs()
-        }
+        out.parentFile?.let { parent -> if (!parent.exists()) parent.mkdirs() }
         if (out.exists()) out.delete()
 
         // 如果 zip 的就是当前这一天，先 flush 一下 mainSink，拿一个快照文件引用
         val mainLogForDay: File? = if (day == currentDay) {
-            try {
-                mainSink?.flush()
-            } catch (_: Throwable) {
-            }
-            val mainFile = File(baseDir, "main.log")
-            if (mainFile.exists()) mainFile else null
-        } else {
-            null
-        }
+            try { mainSink?.flush() } catch (_: Throwable) {}
+            File(baseDir, "main.log").takeIf { it.exists() }
+        } else null
 
         ZipOutputStream(out.outputStream()).use { zip ->
+            // ✅ 关键：只包一次 Okio Sink，全程复用
+            val zipSink = zip.sink().buffer()
 
-            // 先把 dayDir 下所有文件打进去（但如果是当前天，先跳过已有的 app.log，后面用“合并版”替换）
+            // 先把 dayDir 下所有文件打进去
             dayDir.walkTopDown()
                 .filter { it.isFile }
                 .forEach { file ->
-                    if (day == currentDay && file.name == "app.log") {
-                        return@forEach
-                    }
+                    // 当前天：跳过已有 app.log，后面生成“合并版”覆盖进 zip
+                    if (day == currentDay && file.name == "app.log") return@forEach
 
                     val rel = file.relativeTo(baseDir).invariantSeparatorsPath
                     zip.putNextEntry(ZipEntry(rel))
+
                     file.source().use { src ->
-                        src.buffer().readAll(zip.sink().buffer()).also {
-                            // 注意：这里不能用同一个 sink 复用，ZipOutputStream 直接写即可
-                        }
+                        // ✅ 正确：writeAll 直接把 src 写进 zipSink
+                        zipSink.writeAll(src)
+                        // ✅ 关键：每个 entry 写完 flush，避免小文件卡在 buffer 里变 0KB
+                        zipSink.flush()
                     }
+
                     zip.closeEntry()
                 }
 
-            // 如果是当前天，需要在 zip 里生成一个合并版 app.log：
-            // [ dayDir/app.log(如果有) ] + [ main.log ]
+            // 当前天：生成合并版 app.log = [dayDir/app.log(如果有)] + [main.log]
             if (day == currentDay) {
                 val appLogFile = File(dayDir, "app.log")
-                val zipEntryPath = appLogFile
-                    .relativeTo(baseDir)
-                    .invariantSeparatorsPath
+                val zipEntryPath = appLogFile.relativeTo(baseDir).invariantSeparatorsPath
 
                 zip.putNextEntry(ZipEntry(zipEntryPath))
 
                 if (appLogFile.exists()) {
-                    appLogFile.inputStream().use { it.copyTo(zip) }
+                    appLogFile.source().use { src ->
+                        zipSink.writeAll(src)
+                    }
                 }
-                mainLogForDay?.inputStream()?.use { it.copyTo(zip) }
+                mainLogForDay?.takeIf { it.exists() }?.let { mainFile ->
+                    mainFile.source().use { src ->
+                        zipSink.writeAll(src)
+                    }
+                }
 
+                zipSink.flush()
                 zip.closeEntry()
             }
+
+            // 结束前再 flush 一次，稳
+            zipSink.flush()
         }
 
         return out
