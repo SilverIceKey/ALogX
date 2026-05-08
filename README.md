@@ -124,6 +124,22 @@ ALogX.writeBlobString("TAG", "img_base64.txt", base64Text)
 ```
 大文件不会塞进普通文本日志里！
 
+## 🧠 内存 Dump
+
+一键导出当前内存状态，方便排查内存问题：
+
+```kotlin
+ALog.meminfo("MemInfo")
+```
+
+输出文件包含：
+- **JVM 堆内存**：Max / Total / Free / Used
+- **本进程内存**：Dalvik Pss / Native Pss / Total Pss / PrivateDirty
+- **系统整体内存**：Total / Available / Threshold / Low Memory 状态
+- **所有进程内存排名**：`dumpsys meminfo` 完整输出（root 设备才有）
+
+> 有 root 时可以看到系统里所有应用的内存占用，方便定位是不是其他 App 把内存吃光了。无 root 时前三项正常输出，dumpsys 部分标注为不可用。
+
 ## 📦 获取某一天日志 ZIP
 
 ```kotlin

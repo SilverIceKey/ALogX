@@ -1,6 +1,8 @@
 package com.sik.alogx
 
+import android.app.ActivityManager
 import android.content.Context
+import android.os.Debug
 import android.os.Environment
 import android.util.Log
 import okio.BufferedSink
@@ -64,6 +66,9 @@ object LogCenter {
     /** 当前应用包名，用于过滤 logcat */
     private lateinit var packageName: String
 
+    /** Application Context，用于获取系统服务 */
+    private var appContext: Context? = null
+
     /**
      * 大块数据（blob）信息：
      * - relativePath：相对于 baseDir 的路径，写进日志用
@@ -86,6 +91,7 @@ object LogCenter {
     fun init(context: Context, cfg: LogConfig) {
         config = cfg
         packageName = context.packageName
+        appContext = context.applicationContext
 
         // /sdcard/app_name/logs
         baseDir = File(
@@ -669,6 +675,119 @@ object LogCenter {
         }
 
         return out
+    }
+
+    // ============================================================
+    // 内存 dump
+    // ============================================================
+
+    /**
+     * 收集当前内存状态并保存为 blob 文件。
+     *
+     * 包含：
+     * - JVM 堆内存（Runtime）
+     * - 本进程详细内存（Debug.MemoryInfo）
+     * - 系统整体内存（ActivityManager.MemoryInfo）
+     * - dumpsys meminfo（需要 root，无 root 则标注不可用）
+     *
+     * @param tag 日志 TAG，用于在主日志中打引用
+     * @return BlobInfo? 文件引用，失败返回 null
+     */
+    @Synchronized
+    fun dumpMeminfo(tag: String): BlobInfo? {
+        rolloverIfNeeded()
+
+        val sb = StringBuilder()
+        sb.appendLine("========== Memory Dump ==========")
+        sb.appendLine("Time:    ${Utils.now()}")
+        sb.appendLine("Package: $packageName")
+        sb.appendLine("PID:     ${android.os.Process.myPid()}")
+        sb.appendLine()
+
+        // 1. JVM 堆内存
+        val runtime = Runtime.getRuntime()
+        val maxMem = runtime.maxMemory()
+        val totalMem = runtime.totalMemory()
+        val freeMem = runtime.freeMemory()
+        val usedMem = totalMem - freeMem
+
+        sb.appendLine("--- JVM Heap ---")
+        sb.appendLine("Max:    ${formatBytes(maxMem)}")
+        sb.appendLine("Total:  ${formatBytes(totalMem)}")
+        sb.appendLine("Free:   ${formatBytes(freeMem)}")
+        sb.appendLine("Used:   ${formatBytes(usedMem)}")
+        sb.appendLine()
+
+        // 2. 本进程 Native / Dalvik 内存
+        try {
+            val mi = Debug.MemoryInfo()
+            Debug.getMemoryInfo(mi)
+            sb.appendLine("--- Process MemoryInfo ---")
+            sb.appendLine("Dalvik Pss:          ${formatBytes(mi.dalvikPss * 1024L)}")
+            sb.appendLine("Native Pss:          ${formatBytes(mi.nativePss * 1024L)}")
+            sb.appendLine("Total Pss:           ${formatBytes(mi.totalPss * 1024L)}")
+            sb.appendLine("Dalvik PrivateDirty: ${formatBytes(mi.dalvikPrivateDirty * 1024L)}")
+            sb.appendLine("Native PrivateDirty: ${formatBytes(mi.nativePrivateDirty * 1024L)}")
+            sb.appendLine("Total PrivateDirty:  ${formatBytes(mi.totalPrivateDirty * 1024L)}")
+            sb.appendLine()
+        } catch (e: Exception) {
+            sb.appendLine("--- Process MemoryInfo ---")
+            sb.appendLine("Error: ${e.message}")
+            sb.appendLine()
+        }
+
+        // 3. 系统整体内存
+        appContext?.let { ctx ->
+            try {
+                val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                val memInfo = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(memInfo)
+                sb.appendLine("--- System Memory ---")
+                sb.appendLine("Total:      ${formatBytes(memInfo.totalMem)}")
+                sb.appendLine("Available:  ${formatBytes(memInfo.availMem)}")
+                sb.appendLine("Threshold:  ${formatBytes(memInfo.threshold)}")
+                sb.appendLine("Low Memory: ${memInfo.lowMemory}")
+                sb.appendLine()
+            } catch (e: Exception) {
+                sb.appendLine("--- System Memory ---")
+                sb.appendLine("Error: ${e.message}")
+                sb.appendLine()
+            }
+        } ?: run {
+            sb.appendLine("--- System Memory ---")
+            sb.appendLine("Context not available (call LogCenter.init first)")
+            sb.appendLine()
+        }
+
+        // 4. dumpsys meminfo（需要 root，输出所有进程）
+        sb.appendLine("--- dumpsys meminfo (all processes) ---")
+        val dumpsys = try {
+            Runtime.getRuntime()
+                .exec(arrayOf("su", "-c", "dumpsys meminfo"))
+                .inputStream.bufferedReader()
+                .use { it.readText() }
+        } catch (e: Exception) {
+            "Unavailable (root required): ${e.javaClass.simpleName}"
+        }
+        sb.append(dumpsys)
+        sb.appendLine()
+        sb.appendLine("=================================")
+
+        return saveBlobString(sb.toString(), ".meminfo.txt")
+    }
+
+    /**
+     * 字节数格式化为人类可读字符串。
+     */
+    private fun formatBytes(bytes: Long): String {
+        val kb = bytes / 1024.0
+        val mb = kb / 1024.0
+        val gb = mb / 1024.0
+        return when {
+            gb >= 1 -> String.format("%.2f GB", gb)
+            mb >= 1 -> String.format("%.2f MB", mb)
+            else -> String.format("%.2f KB", kb)
+        }
     }
 
     // ============================================================
