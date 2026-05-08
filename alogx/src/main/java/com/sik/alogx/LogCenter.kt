@@ -516,17 +516,39 @@ object LogCenter {
     /**
      * 开启 logcat 捕获线程（可过滤包名）。
      * 把系统日志写入 yyyy-MM-dd/logcat.log。
+     *
+     * 策略：
+     * 1. 先尝试用 su 权限执行，获取完整系统 logcat
+     * 2. 无 su 则降级为普通权限，只能拿到本应用日志
      */
     private fun startLogcatCollector() {
         if (logcatThread != null) return
 
         logcatThread = Thread({
             try {
-                // 清空旧 logcat 缓存（如果你想保留系统之前的 log，可以把这行删掉）
-                Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
+                // 先探测 root 可用性：尝试用 su 清空 logcat
+                val hasRoot = try {
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -c")).waitFor() == 0
+                } catch (_: Exception) {
+                    false
+                }
 
-                // 启动 logcat 流
-                val proc = Runtime.getRuntime().exec(config.logcatCmd.toTypedArray())
+                if (!hasRoot) {
+                    // 降级：普通权限清空（可能失败，忽略）
+                    try {
+                        Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
+                    } catch (_: Exception) {
+                    }
+                }
+
+                // 启动 logcat 流：优先 su，降级普通权限
+                val proc = if (hasRoot) {
+                    Runtime.getRuntime().exec(
+                        arrayOf("su", "-c", config.logcatCmd.joinToString(" "))
+                    )
+                } else {
+                    Runtime.getRuntime().exec(config.logcatCmd.toTypedArray())
+                }
                 val reader = proc.inputStream.bufferedReader()
 
                 var line: String? = null
