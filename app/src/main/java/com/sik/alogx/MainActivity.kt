@@ -208,6 +208,12 @@ fun Greeting(name: String, modifier: Modifier = Modifier) {
         }) {
             Text("输出日志")
         }
+
+        Button(onClick = {
+            ALog.meminfo("MemInfo")
+        }) {
+            Text("Dump 内存")
+        }
     }
 }
 
