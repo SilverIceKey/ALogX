@@ -69,6 +69,10 @@ object LogCenter {
     /** Application Context，用于获取系统服务 */
     private var appContext: Context? = null
 
+    /** 缓存检测到的 su 路径，避免重复探测 */
+    @Volatile
+    private var suPath: String? = null
+
     /**
      * 大块数据（blob）信息：
      * - relativePath：相对于 baseDir 的路径，写进日志用
@@ -516,6 +520,55 @@ object LogCenter {
     }
 
     // ============================================================
+    // root / su 探测
+    // ============================================================
+
+    /**
+     * 探测设备上可用的 su 二进制路径。
+     * 尝试多个常见位置，用 `echo root_test` 做真实验证。
+     *
+     * @return su 完整路径（如 "/system/xbin/su"），探测不到返回 null
+     */
+    private fun detectSu(): String? {
+        suPath?.let { return it }
+
+        val candidates = listOf(
+            "su",
+            "/system/xbin/su",
+            "/system/bin/su",
+            "/su/bin/su",
+            "/magisk/.core/bin/su",
+            "/sbin/su"
+        )
+
+        for (path in candidates) {
+            try {
+                val proc = Runtime.getRuntime().exec(arrayOf(path, "-c", "echo root_test"))
+                val output = proc.inputStream.bufferedReader().use { it.readText() }
+                val exit = proc.waitFor()
+                if (exit == 0 && output.trim() == "root_test") {
+                    suPath = path
+                    return path
+                }
+            } catch (_: Exception) {
+                // 继续试下一个路径
+            }
+        }
+        return null
+    }
+
+    /**
+     * 用已探测到的 su 执行命令。
+     *
+     * @param cmd 要执行的命令字符串（如 "dumpsys meminfo"）
+     * @return Process 对象，调用方自行读取输出
+     */
+    private fun execWithSu(cmd: String): Process? {
+        val su = detectSu() ?: return null
+        return Runtime.getRuntime().exec(arrayOf(su, "-c", cmd))
+    }
+
+    // ============================================================
     // logcat 捕获
     // ============================================================
 
@@ -532,14 +585,17 @@ object LogCenter {
 
         logcatThread = Thread({
             try {
-                // 先探测 root 可用性：尝试用 su 清空 logcat
-                val hasRoot = try {
-                    Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -c")).waitFor() == 0
-                } catch (_: Exception) {
-                    false
-                }
+                // 先探测 root 可用性
+                val su = detectSu()
+                val hasRoot = su != null
 
-                if (!hasRoot) {
+                if (hasRoot) {
+                    // 用 su 清空 logcat（忽略失败）
+                    try {
+                        execWithSu("logcat -c")?.waitFor()
+                    } catch (_: Exception) {
+                    }
+                } else {
                     // 降级：普通权限清空（可能失败，忽略）
                     try {
                         Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
@@ -549,9 +605,8 @@ object LogCenter {
 
                 // 启动 logcat 流：优先 su，降级普通权限
                 val proc = if (hasRoot) {
-                    Runtime.getRuntime().exec(
-                        arrayOf("su", "-c", config.logcatCmd.joinToString(" "))
-                    )
+                    execWithSu(config.logcatCmd.joinToString(" "))
+                        ?: Runtime.getRuntime().exec(config.logcatCmd.toTypedArray())
                 } else {
                     Runtime.getRuntime().exec(config.logcatCmd.toTypedArray())
                 }
@@ -762,10 +817,10 @@ object LogCenter {
         // 4. dumpsys meminfo（需要 root，输出所有进程）
         sb.appendLine("--- dumpsys meminfo (all processes) ---")
         val dumpsys = try {
-            Runtime.getRuntime()
-                .exec(arrayOf("su", "-c", "dumpsys meminfo"))
-                .inputStream.bufferedReader()
-                .use { it.readText() }
+            execWithSu("dumpsys meminfo")
+                ?.inputStream?.bufferedReader()
+                ?.use { it.readText() }
+                ?: "Unavailable (root not detected)"
         } catch (e: Exception) {
             "Unavailable (root required): ${e.javaClass.simpleName}"
         }
