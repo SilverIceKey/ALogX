@@ -195,9 +195,9 @@ object ALog {
 
     /**
      * 收集当前内存状态（JVM + 进程 + 系统 + dumpsys），
-     * 保存为 blob 文件，并在主日志里打一个引用。
+     * 保存到 yyyy-MM-dd/meminfo.txt（覆盖模式），并在主日志里打一个引用。
      *
-     * 有 root 时 dumpsys meminfo 会输出详细数据，
+     * 有 root 时 dumpsys meminfo 会输出所有进程数据，
      * 无 root 时该部分标注为不可用。
      */
     fun meminfo(tag: String = "MemInfo") {
@@ -207,7 +207,7 @@ object ALog {
         } else {
             i(
                 tag,
-                "meminfo dumped | size=${info.size} | hash=${info.hash} | path=${info.relativePath}"
+                "meminfo dumped | size=${info.size} | path=${info.relativePath}"
             )
         }
     }

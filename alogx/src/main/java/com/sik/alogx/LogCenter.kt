@@ -737,7 +737,7 @@ object LogCenter {
     // ============================================================
 
     /**
-     * 收集当前内存状态并保存为 blob 文件。
+     * 收集当前内存状态并保存到日期目录下的 meminfo.txt。
      *
      * 包含：
      * - JVM 堆内存（Runtime）
@@ -745,12 +745,23 @@ object LogCenter {
      * - 系统整体内存（ActivityManager.MemoryInfo）
      * - dumpsys meminfo（需要 root，无 root 则标注不可用）
      *
+     * 文件位置：yyyy-MM-dd/meminfo.txt（和 app.log / logcat.log 同级）
+     * 每次调用覆盖前一次，不保留历史版本。
+     *
      * @param tag 日志 TAG，用于在主日志中打引用
-     * @return BlobInfo? 文件引用，失败返回 null
+     * @return BlobInfo 文件引用（hash 字段为空，因为覆盖模式不做去重），失败返回 null
      */
     @Synchronized
     fun dumpMeminfo(tag: String): BlobInfo? {
         rolloverIfNeeded()
+
+        if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
+
+        val dayDir = File(baseDir, currentDay)
+        if (!dayDir.exists() && !dayDir.mkdirs()) {
+            Log.e("ALogX", "dumpMeminfo: mkdirs dayDir failed: ${dayDir.absolutePath}")
+            return null
+        }
 
         val sb = StringBuilder()
         sb.appendLine("========== Memory Dump ==========")
@@ -828,7 +839,19 @@ object LogCenter {
         sb.appendLine()
         sb.appendLine("=================================")
 
-        return saveBlobString(sb.toString(), ".meminfo.txt")
+        // 直接写到 yyyy-MM-dd/meminfo.txt，覆盖模式
+        val file = File(dayDir, "meminfo.txt")
+        return try {
+            file.sink(append = false).buffer().use { sink ->
+                sink.writeUtf8(sb.toString())
+                sink.flush()
+            }
+            val rel = file.relativeTo(baseDir).invariantSeparatorsPath
+            BlobInfo(relativePath = rel, size = file.length().toInt(), hash = "-")
+        } catch (e: IOException) {
+            Log.e("ALogX", "dumpMeminfo write error: ${e.message}", e)
+            null
+        }
     }
 
     /**
