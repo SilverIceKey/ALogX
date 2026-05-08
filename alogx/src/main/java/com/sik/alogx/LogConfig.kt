@@ -13,6 +13,6 @@ data class LogConfig(
     val appName: String = "ALogX",
     val maxKeepDays: Int = 7,
     val enableLogcat: Boolean = true,
-    val logcatCmd: Array<String> = arrayOf("logcat", "-v", "threadtime"),
+    val logcatCmd: List<String> = listOf("logcat", "-v", "time"),
     val onlyPackageLogcat: Boolean = true
 )

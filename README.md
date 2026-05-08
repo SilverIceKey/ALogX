@@ -152,7 +152,7 @@ logs_2025-11-13.zip
 ```kotlin
 enableLogcat = true
 onlyPackageLogcat = true
-logcatCmd = arrayOf("logcat", "-v", "time")
+logcatCmd = listOf("logcat", "-v", "time")
 ```
 
 ## 📁 日志目录结构（示例）

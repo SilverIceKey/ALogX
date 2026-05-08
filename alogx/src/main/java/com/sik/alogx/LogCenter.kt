@@ -526,7 +526,7 @@ object LogCenter {
                 Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
 
                 // 启动 logcat 流
-                val proc = Runtime.getRuntime().exec(config.logcatCmd)
+                val proc = Runtime.getRuntime().exec(config.logcatCmd.toTypedArray())
                 val reader = proc.inputStream.bufferedReader()
 
                 var line: String? = null
