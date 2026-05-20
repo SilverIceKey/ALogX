@@ -2,6 +2,7 @@ package com.sik.alogx
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * ===============================================================
@@ -53,9 +54,23 @@ object ALog {
      * 实际效果：
      *     D/MainActivity.kt: 你好
      */
+    private val tagCache = ConcurrentHashMap<String, String>()
+    private val lastCaller = ThreadLocal<Pair<String, String>?>()
+
     private fun autoTag(): String {
         val stack = Throwable().stackTrace
-        return stack.getOrNull(2)?.fileName ?: "ALogX"
+        val element = stack.getOrNull(2) ?: return "ALogX"
+        val className = element.className
+
+        // 同一线程连续从同一个类调用时，走 ThreadLocal 快路径
+        val last = lastCaller.get()
+        if (last != null && last.first == className) return last.second
+
+        val tag = tagCache.getOrPut(className) {
+            element.fileName ?: "ALogX"
+        }
+        lastCaller.set(className to tag)
+        return tag
     }
 
     fun v(msg: String) = v(autoTag(), msg)
@@ -73,18 +88,11 @@ object ALog {
      * 所以这里自动做分段，避免被截断。
      */
     fun long(tag: String, msg: String, maxLen: Int = 3000) {
-
         if (msg.length <= maxLen) {
             d(tag, msg)
             return
         }
-
-        var index = 0
-        while (index < msg.length) {
-            val end = (index + maxLen).coerceAtMost(msg.length)
-            d(tag, msg.substring(index, end))
-            index = end
-        }
+        LogCenter.logLong('D', tag, msg, maxLen)
     }
 
 
@@ -94,6 +102,12 @@ object ALog {
      * 自动判断是 {} 还是 []，并格式化为美观的 JSON。
      */
     fun json(tag: String, json: String) {
+        val maxFormatLen = 200 * 1024
+        if (json.length > maxFormatLen) {
+            w(tag, "JSON too large (${json.length} chars), skip formatting")
+            long(tag, json)
+            return
+        }
         try {
             val trim = json.trim()
             val formatted = when {
@@ -122,11 +136,22 @@ object ALog {
      *  01 FF 0A 9C ...
      */
     fun hex(tag: String, bytes: ByteArray) {
-        val sb = StringBuilder()
-        for (b in bytes) {
-            sb.append(String.format("%02X ", b))
+        val maxHexBytes = 100 * 1024
+        val actualLen = bytes.size.coerceAtMost(maxHexBytes)
+        if (bytes.size > maxHexBytes) {
+            w(tag, "ByteArray too large (${bytes.size} bytes), only output first $maxHexBytes bytes")
         }
-        long(tag, sb.toString())
+        val sb = StringBuilder(actualLen * 3)
+        for (i in 0 until actualLen) {
+            val v = bytes[i].toInt() and 0xFF
+            sb.append(HEX_ARRAY[v ushr 4])
+                .append(HEX_ARRAY[v and 0x0F])
+                .append(' ')
+        }
+        if (bytes.size > maxHexBytes) {
+            sb.append("... (truncated)")
+        }
+        d(tag, sb.toString())
     }
 
     // ─────────────────── Blob：大块二进制数据输出 ───────────────────
@@ -141,6 +166,10 @@ object ALog {
      * @return BlobInfo 文件相对路径
      */
     fun blob(tag: String, label: String, bytes: ByteArray, suffix: String = ".bin"): String {
+        if (bytes.size > 50 * 1024 * 1024) {
+            e(tag, "blob rejected: size ${bytes.size} exceeds 50MB safety limit | label=$label")
+            return ""
+        }
         val info = LogCenter.saveBlob(bytes, suffix)
         if (info == null) {
             e(tag, "blob save failed | label=$label | size=${bytes.size}")

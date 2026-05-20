@@ -3,7 +3,7 @@ package com.sik.alogx
 /**
  * Hex数组
  */
-private val HEX_ARRAY = "0123456789ABCDEF".toCharArray()
+internal val HEX_ARRAY = "0123456789ABCDEF".toCharArray()
 
 /**
  * ByteArray 转 Hex 字符串。

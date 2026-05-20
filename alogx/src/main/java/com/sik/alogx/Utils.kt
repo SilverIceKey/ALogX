@@ -12,30 +12,23 @@ import java.util.*
  */
 internal object Utils {
 
-    /** 统一用这个时区，默认取系统当前时区 */
-    private val zone: TimeZone
-        get() = TimeZone.getDefault()
-
-    /** 按天分目录的日期格式：2025-11-13 */
-    val dayFmt: SimpleDateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).apply {
-        timeZone = zone
-    }
-
-    /** 单条日志前缀时间：2025-11-13 12:30:33.123 */
-    val timeFmt: SimpleDateFormat =
-        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).apply {
-            timeZone = zone
+    private val dayFmt = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat {
+            return SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).apply {
+                timeZone = TimeZone.getDefault()
+            }
         }
-
-    /** 返回今日日期字符串 */
-    fun today(): String {
-        dayFmt.timeZone = zone   // 防止运行时用户改了时区，重新刷新
-        return dayFmt.format(Date())
     }
 
-    /** 返回当前完整时间（含毫秒） */
-    fun now(): String {
-        timeFmt.timeZone = zone
-        return timeFmt.format(Date())
+    private val timeFmt = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat {
+            return SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).apply {
+                timeZone = TimeZone.getDefault()
+            }
+        }
     }
+
+    fun today(): String = dayFmt.get()!!.format(Date())
+
+    fun now(): String = timeFmt.get()!!.format(Date())
 }
