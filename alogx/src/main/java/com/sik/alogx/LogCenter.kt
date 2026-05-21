@@ -249,14 +249,19 @@ object LogCenter {
      * 目录结构示例：
      *   /sdcard/ALogX/logs/2025-11-14/blobs/ab23cd9f.png
      */
+    /**
+     * 将一段二进制数据保存到"当天目录/blobs/"下，并返回引用信息。
+     *
+     * 目录结构示例：
+     *   /sdcard/ALogX/logs/2025-11-14/blobs/ab23cd9f.png
+     *
+     * 实现改为 Okio HashingSink：边写边算 md5，避免对大 byte[] 做全量内存扫描。
+     */
     fun saveBlob(bytes: ByteArray, suffix: String = ".bin"): BlobInfo? {
         val warnThreshold = 20 * 1024 * 1024
         if (bytes.size > warnThreshold) {
             Log.w("ALogX", "saveBlob: extremely large blob (${bytes.size} bytes), consider using openTextBlobStream()")
         }
-
-        // md5 计算移到锁外，减少大对象在全局锁内的停留时间
-        val hash = md5(bytes)
 
         synchronized(blobLock) {
             rolloverIfNeeded()
@@ -280,27 +285,33 @@ object LogCenter {
                 return null
             }
 
-            val file = File(blobDir, "$hash$suffix")
-
-            file.parentFile?.let { parent ->
-                if (!parent.exists() && !parent.mkdirs()) {
-                    Log.e("ALogX", "saveBlob: mkdirs parent failed: ${parent.absolutePath}")
-                    return null
-                }
-            }
+            val tmp = File(blobDir, "tmp_${System.currentTimeMillis()}$suffix")
 
             return try {
-                file.sink(append = false).buffer().use { sink ->
-                    sink.write(bytes)
-                    sink.flush()
+                val rawSink = tmp.sink(append = false)
+                val hashingSink = HashingSink.md5(rawSink)
+                val buffered = hashingSink.buffer()
+
+                buffered.write(bytes)
+                buffered.flush()
+                buffered.close()
+
+                val hash = hashingSink.hash.hex()
+                val dst = File(blobDir, "$hash$suffix")
+                if (dst.exists()) {
+                    tmp.delete()
+                } else {
+                    tmp.renameTo(dst)
                 }
-                val relPath = file.relativeTo(baseDir).invariantSeparatorsPath
+
+                val relPath = dst.relativeTo(baseDir).invariantSeparatorsPath
                 BlobInfo(
                     relativePath = relPath,
-                    size = bytes.size,
+                    size = dst.length().toInt(),
                     hash = hash
                 )
             } catch (e: IOException) {
+                tmp.delete()
                 Log.e("ALogX", "saveBlob error: ${e.message}", e)
                 null
             }
@@ -436,15 +447,6 @@ object LogCenter {
         }
 
         return OpenBlobResult(output = os, commit = commit)
-    }
-
-    /**
-     * 计算 md5 摘要，用于 blob 文件名。
-     */
-    private fun md5(bytes: ByteArray): String {
-        val md = MessageDigest.getInstance("MD5")
-        val dig = md.digest(bytes)
-        return dig.joinToString("") { "%02x".format(it) }
     }
 
     /**

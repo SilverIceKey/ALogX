@@ -200,7 +200,7 @@ object ALog {
      * @param content  已经转换好的 blob 数据（String），不会再做 decode
      * @param suffix   文件后缀，例如 ".txt"、".b64"、".hex"
      */
-    fun blobString(tag: String, label: String, content: String, suffix: String = ".txt") {
+    fun blobString(tag: String, label: String, content: String, suffix: String = ".txt"): String {
         val info = LogCenter.saveBlobString(content, suffix)
         if (info == null) {
             e(tag, "blobString save failed | label=$label | length=${content.length}")
@@ -210,13 +210,14 @@ object ALog {
                 "blobString saved | label=$label | length=${content.length} | bytes=${info.size} | hash=${info.hash} | blobPath=${info.relativePath}"
             )
         }
+        return info?.relativePath.orEmpty()
     }
 
     /**
      * 自动 TAG 版本：直接传 label + content。
      */
-    fun blobString(label: String, content: String, suffix: String = ".txt") {
-        blobString(autoTag(), label, content, suffix)
+    fun blobString(label: String, content: String, suffix: String = ".txt"): String {
+        return blobString(autoTag(), label, content, suffix)
     }
 
 
