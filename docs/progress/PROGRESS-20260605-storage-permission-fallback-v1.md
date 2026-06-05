@@ -3,7 +3,7 @@
 ## 当前状态
 
 - 当前主任务：修复 ALogX 在调用方尚未授予外部存储权限时，首次写入 `/sdcard/{appName}/logs/main.log` 可能抛异常并导致调用方崩溃的问题。
-- 当前阶段：框架源码修复已落盘，`1.0.11` 已发布到 Maven Local，NewSelfOpenCard 联动编译验证通过。
+- 当前阶段：框架源码修复已落盘，`1.0.11` 已发布到 Maven Local，并已推送 GitHub tag `1.0.11`，NewSelfOpenCard 联动编译验证通过。
 
 ## 根因判断
 
@@ -41,4 +41,4 @@
 ## 风险
 
 - 未授权阶段若公共目录不可写，早期日志会落到 app-specific 或 internal files 目录；授权后再次 init 才会回到公共目录。
-- `1.0.11` 当前只确认发布到 Maven Local；调用方 CI 或其他开发机需要同步远端发布或 tag。
+- GitHub tag `1.0.11` 已推送；调用方 CI 或其他开发机首次解析时仍需确认依赖源已完成构建缓存。

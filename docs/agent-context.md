@@ -7,7 +7,7 @@
 - 本轮修复：`LogCenter.init()` 会先尝试公共目录，再降级到 app-specific 外部目录，最后降级到 internal files 目录；所有日志写入入口统一走 `safeRolloverIfNeeded()`，目录或 sink 打开失败只关闭文件日志并写 Android Log，不再抛给业务方；`openTextBlobStream()` 和 `saveBlobString()` 也补齐 sink 创建异常保护。
 - 当前版本：`gradle.properties` 的 `VERSION` 调整为 `1.0.11`，用于 NewSelfOpenCard 通过 `mavenLocal()` 验证修复版。
 - 当前验证：`./gradlew :alogx:assembleRelease publishToMavenLocal` 通过并发布 Maven Local；NewSelfOpenCard 已切到 `com.github.SilverIceKey:ALogX:1.0.11`，`dependencyInsight` 确认解析到 `1.0.11`，局部编译和全机型 `compileReleaseKotlin` 均通过。
-- 未完成验证：未做 Android 9 真机新装未授权回放；需要确认未授权启动不崩、授权后公共目录日志可生成。`1.0.11` 当前只确认发布到 Maven Local，CI 或其他开发机需要同步远端依赖源。
+- 未完成验证：未做 Android 9 真机新装未授权回放；需要确认未授权启动不崩、授权后公共目录日志可生成。GitHub tag `1.0.11` 已推送，CI 或其他开发机首次解析时仍需确认依赖源已完成构建缓存。
 
 ## 当前主任务
 
