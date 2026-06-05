@@ -63,6 +63,10 @@ object LogCenter {
     @Volatile
     private var logcatThread: Thread? = null
 
+    /** 文件日志是否可用。目录不可写时关闭文件写入，避免日志系统拖垮调用方。 */
+    @Volatile
+    private var fileLoggingEnabled: Boolean = false
+
     /** 当前应用包名，用于过滤 logcat */
     private lateinit var packageName: String
 
@@ -102,31 +106,93 @@ object LogCenter {
      * 初始化 ALogX。建议在 Application.onCreate 调用。
      */
     fun init(context: Context, cfg: LogConfig) {
+        shutdown()
         config = cfg
         packageName = context.packageName
         appContext = context.applicationContext
+        currentDay = ""
 
-        // /sdcard/app_name/logs
-        baseDir = File(
-            Environment.getExternalStorageDirectory(),
-            "${cfg.appName}/logs"
-        )
+        baseDir = resolveWritableBaseDir(context, cfg)
 
-        if (!baseDir.exists()) {
-            if (!baseDir.mkdirs()) {
-                Log.e("ALogX", "init: mkdirs baseDir failed: ${baseDir.absolutePath}")
-                // 目录都建不出来，后续直接 return，避免一堆 FileNotFound 崩溃
-                return
-            }
+        if (!prepareLogDir(baseDir)) {
+            fileLoggingEnabled = false
+            Log.e("ALogX", "init: log dir unavailable: ${baseDir.absolutePath}")
+            return
         }
 
+        fileLoggingEnabled = true
+
         // 启动时只做一次“状态恢复 / 当天检测”
-        rolloverIfNeeded(force = false)
+        if (!safeRolloverIfNeeded(force = false)) return
 
         // 开启 logcat 采集（系统 logcat → 本地 logcat.log）
         if (cfg.enableLogcat) {
             startLogcatCollector()
         }
+    }
+
+    private fun resolveWritableBaseDir(context: Context, cfg: LogConfig): File {
+        val publicDir = File(
+            Environment.getExternalStorageDirectory(),
+            "${cfg.appName}/logs"
+        )
+        if (prepareLogDir(publicDir)) return publicDir
+
+        val externalFilesDir = context.getExternalFilesDir(null)
+        if (externalFilesDir != null) {
+            val appSpecificDir = File(externalFilesDir, "${cfg.appName}/logs")
+            if (prepareLogDir(appSpecificDir)) {
+                Log.w("ALogX", "fallback to app-specific log dir: ${appSpecificDir.absolutePath}")
+                return appSpecificDir
+            }
+        }
+
+        val internalDir = File(context.filesDir, "${cfg.appName}/logs")
+        if (prepareLogDir(internalDir)) {
+            Log.w("ALogX", "fallback to internal log dir: ${internalDir.absolutePath}")
+            return internalDir
+        }
+
+        return publicDir
+    }
+
+    private fun prepareLogDir(dir: File): Boolean {
+        return try {
+            if (!dir.exists() && !dir.mkdirs()) return false
+            if (!dir.isDirectory) return false
+
+            val probe = File(dir, ".alogx_probe")
+            probe.outputStream().use { }
+            if (probe.exists()) probe.delete()
+            true
+        } catch (e: Throwable) {
+            Log.e("ALogX", "prepareLogDir failed: ${dir.absolutePath}, ${e.message}", e)
+            false
+        }
+    }
+
+    private fun safeRolloverIfNeeded(force: Boolean = false): Boolean {
+        if (!fileLoggingEnabled || !::baseDir.isInitialized) return false
+        return try {
+            rolloverIfNeeded(force)
+            mainSink != null && currentDay.isNotEmpty()
+        } catch (e: Throwable) {
+            disableFileLogging("rollover failed: ${e.message}", e)
+            false
+        }
+    }
+
+    private fun disableFileLogging(reason: String, throwable: Throwable? = null) {
+        fileLoggingEnabled = false
+        try { mainSink?.flush(); mainSink?.close() } catch (_: Throwable) {}
+        mainSink = null
+        synchronized(logcatLock) {
+            try { logcatSink?.flush(); logcatSink?.close() } catch (_: Throwable) {}
+            logcatSink = null
+        }
+        logcatThread?.interrupt()
+        logcatThread = null
+        Log.e("ALogX", reason, throwable)
     }
 
     // ============================================================
@@ -146,7 +212,7 @@ object LogCenter {
 
         // 1) 写文件：在 mainLock 内完成，避免多线程并发写 main.log
         synchronized(mainLock) {
-            rolloverIfNeeded()
+            if (!safeRolloverIfNeeded()) return
             val sink = mainSink ?: return
             ts = Utils.now()
             threadName = Thread.currentThread().name
@@ -191,7 +257,7 @@ object LogCenter {
         val prefix: String
 
         synchronized(mainLock) {
-            rolloverIfNeeded()
+            if (!safeRolloverIfNeeded()) return
             val sink = mainSink ?: return
             ts = Utils.now()
             threadName = Thread.currentThread().name
@@ -264,7 +330,7 @@ object LogCenter {
         }
 
         synchronized(blobLock) {
-            rolloverIfNeeded()
+            if (!safeRolloverIfNeeded()) return null
 
             if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
 
@@ -326,7 +392,7 @@ object LogCenter {
      */
     fun saveBlobString(content: String, suffix: String = ".txt"): BlobInfo? {
         synchronized(blobLock) {
-            rolloverIfNeeded()
+            if (!safeRolloverIfNeeded()) return null
 
             if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
 
@@ -348,14 +414,16 @@ object LogCenter {
             }
 
             val tmp = File(blobDir, "tmp_${System.currentTimeMillis()}$suffix")
-            val raw: Sink = tmp.sink(append = false)
-            val hashing = HashingSink.md5(raw)
-            val buffered = hashing.buffer()
+            var buffered: BufferedSink? = null
 
             return try {
-                buffered.writeUtf8(content)
-                buffered.flush()
-                buffered.close()
+                val raw: Sink = tmp.sink(append = false)
+                val hashing = HashingSink.md5(raw)
+                val activeSink = hashing.buffer()
+                buffered = activeSink
+                activeSink.writeUtf8(content)
+                activeSink.flush()
+                activeSink.close()
 
                 val hash = hashing.hash.hex()
                 val dst = File(blobDir, "$hash$suffix")
@@ -374,7 +442,7 @@ object LogCenter {
                 )
             } catch (e: IOException) {
                 try {
-                    buffered.close()
+                    buffered?.close()
                 } catch (_: Throwable) {
                 }
                 tmp.delete()
@@ -398,7 +466,7 @@ object LogCenter {
         val tmp: File
 
         synchronized(blobLock) {
-            rolloverIfNeeded()
+            if (!safeRolloverIfNeeded()) return null
             if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
 
             dayDir = File(baseDir, currentDay).apply { if (!exists()) mkdirs() }
@@ -407,46 +475,50 @@ object LogCenter {
             tmp = File(blobDir, "tmp_${System.currentTimeMillis()}$suffix")
         }
 
-        val rawSink = tmp.sink(append = false)
-        val hashingSink = HashingSink.md5(rawSink)
-        val buffered = hashingSink.buffer()
+        return try {
+            val rawSink = tmp.sink(append = false)
+            val hashingSink = HashingSink.md5(rawSink)
+            val buffered = hashingSink.buffer()
+            val os: OutputStream = buffered.outputStream()
+            val committed = AtomicBoolean(false)
 
-        val os: OutputStream = buffered.outputStream()
-
-        val committed = AtomicBoolean(false)
-
-        val commit = { writtenBytes: Long ->
-            if (committed.compareAndSet(false, true)) {
-                try {
+            val commit = { writtenBytes: Long ->
+                if (committed.compareAndSet(false, true)) {
                     try {
-                        os.flush()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        os.close()
-                    } catch (_: Throwable) {
-                    }
+                        try {
+                            os.flush()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            os.close()
+                        } catch (_: Throwable) {
+                        }
 
-                    val hash = hashingSink.hash.hex()
-                    val dst = File(blobDir, "$hash$suffix")
-                    if (dst.exists()) {
+                        val hash = hashingSink.hash.hex()
+                        val dst = File(blobDir, "$hash$suffix")
+                        if (dst.exists()) {
+                            tmp.delete()
+                        } else {
+                            tmp.renameTo(dst)
+                        }
+                        val rel = dst.relativeTo(baseDir).invariantSeparatorsPath
+                        BlobInfo(relativePath = rel, size = writtenBytes.toInt(), hash = hash)
+                    } catch (e: Throwable) {
                         tmp.delete()
-                    } else {
-                        tmp.renameTo(dst)
+                        Log.e("ALogX", "openTextBlobStream commit error: ${e.message}", e)
+                        null
                     }
-                    val rel = dst.relativeTo(baseDir).invariantSeparatorsPath
-                    BlobInfo(relativePath = rel, size = writtenBytes.toInt(), hash = hash)
-                } catch (e: Throwable) {
-                    tmp.delete()
-                    Log.e("ALogX", "openTextBlobStream commit error: ${e.message}", e)
+                } else {
                     null
                 }
-            } else {
-                null
             }
-        }
 
-        return OpenBlobResult(output = os, commit = commit)
+            OpenBlobResult(output = os, commit = commit)
+        } catch (e: Throwable) {
+            tmp.delete()
+            Log.e("ALogX", "openTextBlobStream error: ${e.message}", e)
+            null
+        }
     }
 
     /**
@@ -476,7 +548,7 @@ object LogCenter {
      */
     private fun rolloverIfNeeded(force: Boolean = false) {
         synchronized(mainLock) {
-            if (!::baseDir.isInitialized) return
+            if (!fileLoggingEnabled || !::baseDir.isInitialized) return
 
             val today = Utils.today()
             val mainFile = File(baseDir, "main.log")
@@ -687,9 +759,7 @@ object LogCenter {
                     // 是否只记录与本包相关的 logcat 行
                     if (config.onlyPackageLogcat && !t.contains(packageName)) continue
 
-                    synchronized(mainLock) {
-                        rolloverIfNeeded()
-                    }
+                    if (!safeRolloverIfNeeded()) continue
                     synchronized(logcatLock) {
                         try {
                             logcatSink?.apply {
@@ -812,7 +882,7 @@ object LogCenter {
      */
     @Synchronized
     fun dumpMeminfo(tag: String): BlobInfo? {
-        rolloverIfNeeded()
+        if (!safeRolloverIfNeeded()) return null
 
         if (!::baseDir.isInitialized || currentDay.isEmpty()) return null
 
@@ -948,6 +1018,8 @@ object LogCenter {
         } finally {
             logcatSink = null
         }
+        fileLoggingEnabled = false
+        currentDay = ""
 
         logcatThread?.interrupt()
         logcatThread = null

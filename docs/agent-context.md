@@ -1,5 +1,14 @@
 # Agent Context — ALogX
 
+## 最新交接（2026-06-05）
+
+- 当前主任务：修复 Android 应用在未授予外部存储权限时，ALogX 初始化或首次写 `main.log` 抛 `FileNotFoundException` 并拖崩调用方的问题。
+- 最新结论：根因是 ALogX 默认只使用 `/sdcard/{appName}/logs`，且 `rolloverIfNeeded()` 打开 `main.log`、`logcat.log` 的异常未被顶层兜住；调用方即使在业务层做路径判断，一旦公共目录不可写或判断误差，框架仍可能同步抛异常。
+- 本轮修复：`LogCenter.init()` 会先尝试公共目录，再降级到 app-specific 外部目录，最后降级到 internal files 目录；所有日志写入入口统一走 `safeRolloverIfNeeded()`，目录或 sink 打开失败只关闭文件日志并写 Android Log，不再抛给业务方；`openTextBlobStream()` 和 `saveBlobString()` 也补齐 sink 创建异常保护。
+- 当前版本：`gradle.properties` 的 `VERSION` 调整为 `1.0.11`，用于 NewSelfOpenCard 通过 `mavenLocal()` 验证修复版。
+- 当前验证：`./gradlew :alogx:assembleRelease publishToMavenLocal` 通过并发布 Maven Local；NewSelfOpenCard 已切到 `com.github.SilverIceKey:ALogX:1.0.11`，`dependencyInsight` 确认解析到 `1.0.11`，局部编译和全机型 `compileReleaseKotlin` 均通过。
+- 未完成验证：未做 Android 9 真机新装未授权回放；需要确认未授权启动不崩、授权后公共目录日志可生成。`1.0.11` 当前只确认发布到 Maven Local，CI 或其他开发机需要同步远端依赖源。
+
 ## 当前主任务
 
 完成三项迁移：
